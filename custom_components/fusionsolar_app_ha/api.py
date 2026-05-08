@@ -13,6 +13,8 @@ Endpoints used:
   Set config:    POST /rest/neteco/web/homemgr/v1/device/set-config-info
   Start charge:  POST /rest/neteco/web/homemgr/v1/charger/charge/start-charge
   Stop charge:   POST /rest/neteco/web/homemgr/v1/charger/charge/stop-charge
+  Query plan:    POST /rest/neteco/web/homemgr/v1/charger/plan/query-plan
+  Config plan:   POST /rest/neteco/web/homemgr/v1/charger/plan/config-plan
   Device KPI:    GET  /rest/pvms/web/device/v1/device-real-kpi          (inverter/battery/meter)
   Station KPI:   GET  /rest/pvms/web/station/v1/overview/station-real-kpi
   Station list:  POST /rest/pvms/web/station/v1/station/station-list
@@ -141,8 +143,14 @@ class FusionSolarApi:
                 headers=self._headers(auth), ssl=False,
                 timeout=aiohttp.ClientTimeout(total=30),
             ) as resp:
-                resp.raise_for_status()
-                return await resp.json(content_type=None)
+                body = await resp.json(content_type=None)
+                if not resp.ok:
+                    raise FusionSolarApiError(
+                        f"GET {path} failed: {resp.status}, body={body}"
+                    )
+                return body
+        except FusionSolarApiError:
+            raise
         except aiohttp.ClientError as exc:
             raise FusionSolarApiError(f"GET {path} failed: {exc}") from exc
 
@@ -154,8 +162,14 @@ class FusionSolarApi:
                 headers=self._headers(auth), ssl=False,
                 timeout=aiohttp.ClientTimeout(total=30),
             ) as resp:
-                resp.raise_for_status()
-                return await resp.json(content_type=None)
+                body = await resp.json(content_type=None)
+                if not resp.ok:
+                    raise FusionSolarApiError(
+                        f"POST {path} failed: {resp.status}, body={body}"
+                    )
+                return body
+        except FusionSolarApiError:
+            raise
         except aiohttp.ClientError as exc:
             raise FusionSolarApiError(f"POST {path} failed: {exc}") from exc
 
@@ -291,7 +305,7 @@ class FusionSolarApi:
         return {s.get("id", 0): s for s in signals_raw}
 
     # ------------------------------------------------------------------
-    # EV Charger — control (from APK fc2.java + StartChargeParamsRequest)
+    # EV Charger — control
     # ------------------------------------------------------------------
 
     async def start_charge(
@@ -300,13 +314,25 @@ class FusionSolarApi:
         """
         POST start-charge.
         accountId comes from get_user_info()["userId"] (as string).
-        Returns True on success.
+        Returns True on success, False on failure.
         """
         try:
-            await self._post(
+            body = await self._post(
                 "/rest/neteco/web/homemgr/v1/charger/charge/start-charge",
                 {"dnId": dn_id, "gunNumber": gun_number, "accountId": str(account_id)},
             )
+            # Check response: API may return {code: -1} or {isSuccess: false} on failure
+            body = body or {}
+            code = body.get("code")
+            if code is not None and int(code) != 0:
+                _LOGGER.error(
+                    "start-charge returned code %s: %s",
+                    code, body.get("message") or body.get("failCode"),
+                )
+                return False
+            if body.get("isSuccess") is False:
+                _LOGGER.error("start-charge failed: isSuccess=false, failCode=%s", body.get("failCode"))
+                return False
             return True
         except FusionSolarApiError as exc:
             _LOGGER.error("start-charge failed: %s", exc)
@@ -324,7 +350,7 @@ class FusionSolarApi:
         orderNumber and serialNumber come from get_charging_process_data().
         """
         try:
-            await self._post(
+            body = await self._post(
                 "/rest/neteco/web/homemgr/v1/charger/charge/stop-charge",
                 {
                     "dnId": dn_id,
@@ -333,6 +359,17 @@ class FusionSolarApi:
                     "serialNumber": serial_number,
                 },
             )
+            body = body or {}
+            code = body.get("code")
+            if code is not None and int(code) != 0:
+                _LOGGER.error(
+                    "stop-charge returned code %s: %s",
+                    code, body.get("message") or body.get("failCode"),
+                )
+                return False
+            if body.get("isSuccess") is False:
+                _LOGGER.error("stop-charge failed: isSuccess=false, failCode=%s", body.get("failCode"))
+                return False
             return True
         except FusionSolarApiError as exc:
             _LOGGER.error("stop-charge failed: %s", exc)
@@ -343,7 +380,8 @@ class FusionSolarApi:
     ) -> bool:
         """
         POST set-config-info for a single signal.
-        Payload from APK SignalSettingParam: {conditions: [{dnId, signals: [{id, value}]}]}
+        Payload mirrors get-config-info: {conditions: [{dnId (str), signals: [{id, value}]}]}
+        dnId is sent as string per ChargeQuestBo.java (String dnId field).
         Used for: max current (20003), working mode (20002), max grid power (20006),
                   surplus power threshold (20007), dynamic power limit (20001).
         """
@@ -353,22 +391,78 @@ class FusionSolarApi:
                 {
                     "conditions": [
                         {
-                            "dnId": dn_id,
+                            "dnId": str(dn_id),
                             "signals": [{"id": signal_id, "value": str(value)}],
                         }
                     ]
                 },
             )
-            code = (body or {}).get("code", 0)
-            if code != 0:
+            body = body or {}
+            # Some devices return {code: 0} or {configSetResult: true}
+            code = body.get("code")
+            if code is not None and int(code) != 0:
                 _LOGGER.warning(
                     "set-config-info signal %s=%s returned code %s: %s",
-                    signal_id, value, code, (body or {}).get("message", ""),
+                    signal_id, value, code, body.get("message", ""),
                 )
-            return code == 0
+                return False
+            if body.get("configSetResult") is False:
+                _LOGGER.warning("set-config-info signal %s=%s: configSetResult=false", signal_id, value)
+                return False
+            return True
         except FusionSolarApiError as exc:
             _LOGGER.error("set-config-info failed: %s", exc)
             return False
+
+    # ------------------------------------------------------------------
+    # EV Charger — schedule/plan management
+    # ------------------------------------------------------------------
+
+    async def get_charging_plan(self, dn_id: int, account_id: str = "") -> dict:
+        """
+        POST query-plan → {switchOn: int, plans: [...], isSupportMaxPower: bool}
+        From APK ChargingPlanRequest / ChargingPlanResponse (extends ChargeMode).
+        """
+        try:
+            body = await self._post(
+                "/rest/neteco/web/homemgr/v1/charger/plan/query-plan",
+                {"dnId": dn_id, "accountId": account_id},
+            )
+            return (body or {}).get("data") or body or {}
+        except FusionSolarApiError as exc:
+            _LOGGER.debug("query-plan failed (non-fatal): %s", exc)
+            return {}
+
+    async def set_charging_plan(self, dn_id: int, account_id: str, plan_data: dict) -> bool:
+        """
+        POST config-plan with full plan object.
+        plan_data: {switchOn, plans: [{chargeMode, isRepeat, startTime, stopTime,
+                                       maxChargePower, repeatPeriod, isValid}]}
+        """
+        try:
+            payload = {"dnId": dn_id, "accountId": account_id, **plan_data}
+            body = await self._post(
+                "/rest/neteco/web/homemgr/v1/charger/plan/config-plan",
+                payload,
+            )
+            body = body or {}
+            code = body.get("code")
+            if code is not None and int(code) != 0:
+                _LOGGER.error("config-plan returned code %s: %s", code, body.get("message", ""))
+                return False
+            return True
+        except FusionSolarApiError as exc:
+            _LOGGER.error("config-plan failed: %s", exc)
+            return False
+
+    async def set_charging_plan_enabled(self, dn_id: int, account_id: str, enabled: bool) -> bool:
+        """Enable or disable the timed charging schedule (switchOn field)."""
+        plan = await self.get_charging_plan(dn_id, account_id)
+        if not plan:
+            _LOGGER.error("Cannot toggle plan: query-plan returned empty response")
+            return False
+        plan["switchOn"] = 1 if enabled else 0
+        return await self.set_charging_plan(dn_id, account_id, plan)
 
     # ------------------------------------------------------------------
     # Inverter / battery / meter — live KPI via pvms
@@ -389,7 +483,6 @@ class FusionSolarApi:
             },
         )
         data = (body or {}).get("data") or body or {}
-        # Response is keyed by signal ID as string
         if isinstance(data, dict):
             return data
         return {}

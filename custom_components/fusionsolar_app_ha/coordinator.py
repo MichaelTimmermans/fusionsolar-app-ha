@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import logging
 from datetime import timedelta
+from typing import Any
 
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
@@ -53,6 +54,7 @@ class ChargerCoordinator(DataUpdateCoordinator):
       max_current (A), working_mode, max_grid_power (kW)
       surplus_power_start (kW), phase_switch, locking_mode
       max_power_limit (kW), networking_mode, charger_alias, wifi_signal (dBm)
+      schedule_enabled (bool), schedule_plans (list[dict])
     """
 
     def __init__(
@@ -136,6 +138,21 @@ class ChargerCoordinator(DataUpdateCoordinator):
             charger_alias   = parent_cfg.get(20015, {}).get("realValue", "")
             wifi_signal     = _sig_float(parent_cfg, 2101518)
 
+            # 6. Charging schedule (non-critical — don't fail if unavailable)
+            schedule_enabled: bool | None = None
+            schedule_plans: list[dict] | None = None
+            account_id_for_plan = process_account_id or ""
+            if account_id_for_plan:
+                try:
+                    plan_data = await self.api.get_charging_plan(
+                        self.dn_id, account_id_for_plan
+                    )
+                    if plan_data:
+                        schedule_enabled = bool(plan_data.get("switchOn"))
+                        schedule_plans = plan_data.get("plans") or []
+                except Exception as exc:
+                    _LOGGER.debug("Could not fetch charging plan: %s", exc)
+
             return {
                 "status_code":          status_code,
                 "signal_status":        signal_status,
@@ -159,6 +176,8 @@ class ChargerCoordinator(DataUpdateCoordinator):
                 "networking_mode":      networking_mode,
                 "charger_alias":        charger_alias,
                 "wifi_signal":          wifi_signal,
+                "schedule_enabled":     schedule_enabled,
+                "schedule_plans":       schedule_plans,
             }
 
         except FusionSolarAuthError as exc:

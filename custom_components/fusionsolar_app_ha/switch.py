@@ -32,7 +32,10 @@ async def async_setup_entry(
     charger: ChargerCoordinator = data["charger"]
     user_id: str = data.get("user_id", "")
 
-    async_add_entities([ChargingSwitch(charger, user_id)])
+    async_add_entities([
+        ChargingSwitch(charger, user_id),
+        ChargingScheduleSwitch(charger),
+    ])
 
 
 class ChargingSwitch(CoordinatorEntity[ChargerCoordinator], SwitchEntity):
@@ -132,3 +135,65 @@ class ChargingSwitch(CoordinatorEntity[ChargerCoordinator], SwitchEntity):
             await self.coordinator.async_request_refresh()
         else:
             _LOGGER.error("Failed to stop charge")
+
+
+class ChargingScheduleSwitch(CoordinatorEntity[ChargerCoordinator], SwitchEntity):
+    """Switch that enables or disables the charging schedule (timed charging)."""
+
+    _attr_has_entity_name = True
+    _attr_name = "Charging schedule"
+    _attr_icon = "mdi:calendar-clock"
+
+    def __init__(self, coordinator: ChargerCoordinator) -> None:
+        super().__init__(coordinator)
+        self._attr_unique_id = f"{coordinator.dn_id}_charging_schedule_switch"
+
+    @property
+    def device_info(self) -> DeviceInfo:
+        return DeviceInfo(
+            identifiers={(DOMAIN, f"charger_{self.coordinator.dn_id}")},
+            name=self.coordinator.device_name,
+            manufacturer="Huawei",
+            model="FusionSolar EV Charger",
+        )
+
+    @property
+    def is_on(self) -> bool | None:
+        if not self.coordinator.data:
+            return None
+        return self.coordinator.data.get("schedule_enabled")
+
+    @property
+    def available(self) -> bool:
+        if not super().available or not self.coordinator.data:
+            return False
+        return self.coordinator.data.get("schedule_enabled") is not None
+
+    async def async_turn_on(self, **kwargs) -> None:
+        await self._set_schedule(enabled=True)
+
+    async def async_turn_off(self, **kwargs) -> None:
+        await self._set_schedule(enabled=False)
+
+    async def _set_schedule(self, enabled: bool) -> None:
+        data = self.coordinator.data or {}
+        account_id = data.get("account_id", "")
+        if not account_id:
+            _LOGGER.error("Cannot toggle schedule: no accountId available")
+            return
+
+        _LOGGER.info(
+            "Setting charging schedule enabled=%s on charger %s",
+            enabled, self.coordinator.dn_id,
+        )
+
+        success = await self.coordinator.api.set_charging_plan_enabled(
+            dn_id=self.coordinator.dn_id,
+            account_id=account_id,
+            enabled=enabled,
+        )
+
+        if success:
+            await self.coordinator.async_request_refresh()
+        else:
+            _LOGGER.error("Failed to set charging schedule enabled=%s", enabled)
